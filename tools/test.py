@@ -8,6 +8,7 @@ import mmcv
 import os
 import torch
 import warnings
+import json
 from mmcv import Config, DictAction
 from mmcv.cnn import fuse_conv_bn
 from mmcv.parallel import MMDataParallel, MMDistributedDataParallel
@@ -220,17 +221,39 @@ def main():
         # segmentation dataset has `PALETTE` attribute
         model.PALETTE = dataset.PALETTE
 
+    # Measure inference latency
+    num_samples = len(data_loader.dataset)
+    
     if not distributed:
         # assert False
         model = MMDataParallel(model, device_ids=[0])
+        
+        torch.cuda.synchronize()
+        start_time = time.time()
+        
         outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        
+        torch.cuda.synchronize()
+        end_time = time.time()
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
+        
+        torch.cuda.synchronize()
+        start_time = time.time()
+        
         outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
                                         args.gpu_collect)
+        
+        torch.cuda.synchronize()
+        end_time = time.time()
+    
+    # Calculate latency metrics
+    total_inference_time = end_time - start_time
+    avg_latency_ms = (total_inference_time / num_samples) * 1000  # Convert to ms
+    fps = num_samples / total_inference_time
 
     rank, _ = get_dist_info()
     if rank == 0:
@@ -239,8 +262,9 @@ def main():
             assert False
             #mmcv.dump(outputs['bbox_results'], args.out)
         kwargs = {} if args.eval_options is None else args.eval_options
-        kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
+        jsonfile_prefix = osp.join('test', args.config.split(
             '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
+        kwargs['jsonfile_prefix'] = jsonfile_prefix
         if args.format_only:
             dataset.format_results(outputs, **kwargs)
 
@@ -254,7 +278,35 @@ def main():
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, **kwargs))
 
-            print(dataset.evaluate(outputs, **eval_kwargs))
+            eval_results = dataset.evaluate(outputs, **eval_kwargs)
+            print(eval_results)
+            
+            # Prepare latency metrics
+            latency_metrics = {
+                'num_samples': num_samples,
+                'total_inference_time_s': round(total_inference_time, 4),
+                'avg_latency_ms': round(avg_latency_ms, 4),
+                'fps': round(fps, 4),
+            }
+            
+            # Combine evaluation results with latency metrics
+            combined_results = {
+                'evaluation': eval_results,
+                'latency': latency_metrics,
+                'config': args.config,
+                'checkpoint': args.checkpoint,
+            }
+            
+            # Save to JSON file
+            os.makedirs(osp.dirname(jsonfile_prefix) if osp.dirname(jsonfile_prefix) else '.', exist_ok=True)
+            json_output_path = jsonfile_prefix + '_results.json'
+            with open(json_output_path, 'w') as f:
+                json.dump(combined_results, f, indent=2, default=str)
+            print(f'\nResults saved to: {json_output_path}')
+            print(f'\nLatency Metrics:')
+            print(f'  - Total inference time: {total_inference_time:.2f}s')
+            print(f'  - Average latency: {avg_latency_ms:.2f}ms per sample')
+            print(f'  - FPS: {fps:.2f}')
 
 
 if __name__ == '__main__':
